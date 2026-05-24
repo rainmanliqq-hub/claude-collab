@@ -14,6 +14,14 @@ const AI_MODEL = process.env.AI_MODEL || "";
 const COLLAB_CLI = "/Users/rainman/Developer/claude-collab/dist/cli.js";
 const ENV_PATH = "/opt/homebrew/bin:/usr/local/bin:" + (process.env.PATH || "");
 
+async function publishEvent(agent: string, action: string, detail: string) {
+  const redis = getRedis();
+  const event = JSON.stringify({ timestamp: new Date().toISOString(), agent, action, detail });
+  await redis.publish('collab:events', JSON.stringify({ type: 'event', data: JSON.parse(event) }));
+  await redis.lpush('collab:events:log', event);
+  await redis.ltrim('collab:events:log', 0, 499);
+}
+
 const CLAUDE_DEV_PROMPT = `你是 Mac Mini 上的开发者 agent。你的 orchestrator 是 macbook 上的 Claude Opus（项目经理兼架构师）。
 
 ## 工作原则
@@ -23,11 +31,11 @@ const CLAUDE_DEV_PROMPT = `你是 Mac Mini 上的开发者 agent。你的 orches
 
 ## 遇到困难时求助
 如果你不确定该怎么做、指令有歧义、或尝试失败，立刻求助：
-REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node ${COLLAB_CLI} send --from ${AGENT_NAME} --to macbook --msg "[求助] 任务: <简述>。问题: <具体卡点>。已尝试: <做了什么>"
+REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node  send --from  --to macbook --msg "[求助] 任务: <简述>。问题: <具体卡点>。已尝试: <做了什么>"
 
 ## 汇报发现
 执行中发现预期外的问题（比如依赖缺失、文件不存在），主动通知：
-REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node ${COLLAB_CLI} send --from ${AGENT_NAME} --to macbook --msg "[发现] 内容"
+REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node  send --from  --to macbook --msg "[发现] 内容"
 `;
 
 const CLAUDE_TEST_PROMPT = `你是 Mac Mini 上的测试 agent。你的 orchestrator 是 macbook 上的 Claude Opus。
@@ -38,10 +46,10 @@ const CLAUDE_TEST_PROMPT = `你是 Mac Mini 上的测试 agent。你的 orchestr
 3. 发现 bug 时详细描述复现步骤
 
 ## 遇到困难时求助
-REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node ${COLLAB_CLI} send --from ${AGENT_NAME} --to macbook --msg "[求助] 任务: <简述>。问题: <具体卡点>"
+REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node  send --from  --to macbook --msg "[求助] 任务: <简述>。问题: <具体卡点>"
 
 ## 发现缺陷时汇报
-REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node ${COLLAB_CLI} send --from ${AGENT_NAME} --to macbook --msg "[缺陷] 内容"
+REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node  send --from  --to macbook --msg "[缺陷] 内容"
 `;
 
 const CODEX_EXPERT_PROMPT = `你是团队的高级技术顾问（GPT-5.5）。你只在其他 agent 搞不定时才被召唤。
@@ -56,7 +64,7 @@ const CODEX_EXPERT_PROMPT = `你是团队的高级技术顾问（GPT-5.5）。�
 1. 高质量输出，一次搞定
 2. 给出完整解决方案，不要留半成品
 3. 如果需要更多上下文，求助 orchestrator：
-REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node ${COLLAB_CLI} send --from ${AGENT_NAME} --to macbook --msg "[求助] 需要更多上下文: <具体需要什么>"
+REDIS_URL=redis://127.0.0.1:6379 /opt/homebrew/bin/node  send --from  --to macbook --msg "[求助] 需要更多上下文: <具体需要什么>"
 `;
 
 function getTaskMode(title: string): "shell" | "claude" | "codex" {
@@ -163,6 +171,7 @@ async function executeCodex(desc: string): Promise<string> {
 async function pollAndProcess(name: string): Promise<void> {
   const redis = getRedis();
 
+  // 先检查直接指派给我的任务
   const directIds = await redis.smembers(`tasks:agent:${name}`);
   let task: { id: string; title: string; desc: string } | null = null;
 
@@ -174,10 +183,12 @@ async function pollAndProcess(name: string): Promise<void> {
     }
   }
 
+  // 再从公共队列认领（带引擎过滤）
   if (!task) {
     const result = await taskCmd.claim(name, AI_ENGINE);
     if (!result.ok || !result.data) return;
     task = result.data as { id: string; title: string; desc: string };
+    await publishEvent(name, 'task_claimed', '认领任务 #' + task.id + ': ' + task.title);
   }
 
   console.log(`[${new Date().toISOString()}] Processing task ${task.id}: ${task.title} (mode: ${getTaskMode(task.title)})`);
@@ -194,10 +205,14 @@ async function pollAndProcess(name: string): Promise<void> {
     }
 
     await taskCmd.complete(task.id, output);
+    await publishEvent(name, 'task_completed', '任务 #' + task.id + ' 完成。结果: ' + output.slice(0, 2000));
+    const updatedTask = await redis.hgetall('task:' + task.id);
+    await redis.publish('collab:events', JSON.stringify({ type: 'task_update', task: updatedTask }));
     console.log(`[${new Date().toISOString()}] Task ${task.id} completed (${mode})`);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     await taskCmd.complete(task.id, `[error] ${msg}`);
+    await publishEvent(name, 'task_failed', '任务 #' + task.id + ' 失败: ' + msg.slice(0, 500));
     console.error(`Task ${task.id} failed:`, msg);
   }
 }
