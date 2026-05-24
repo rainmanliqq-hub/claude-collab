@@ -1,0 +1,20 @@
+{
+  "name": "claude-collab",
+  "version": "1.0.0",
+  "description": "Multi-agent collaboration system via Redis",
+  "main": "dist/cli.js",
+  "bin": {
+    "collab": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
