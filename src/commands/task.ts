@@ -31,21 +31,44 @@ export async function create(
   return { ok: true, data: task };
 }
 
-export async function claim(name: string): Promise<CommandResult> {
+export async function claim(name: string, engine?: string): Promise<CommandResult> {
   const redis = getRedis();
-  const taskId = await redis.lpop("tasks:queue");
-  if (!taskId) {
-    return { ok: true, data: null, error: "No tasks available" };
+  const queueLen = await redis.llen("tasks:queue");
+
+  for (let i = 0; i < queueLen; i++) {
+    const taskId = await redis.lindex("tasks:queue", i);
+    if (!taskId) continue;
+
+    const data = await redis.hgetall(`task:${taskId}`);
+    if (!data.id || data.status !== "pending") continue;
+
+    const titleLower = (data.title || "").trim().toLowerCase();
+    const prefixMatch = titleLower.match(/^\[(shell|claude|codex|dev|test|expert)\]/);
+
+    if (prefixMatch) {
+      const prefix = prefixMatch[1];
+      const engineMap: Record<string, string> = { shell: "shell", claude: "claude", codex: "codex", dev: "claude", test: "claude", expert: "codex" };
+      const requiredEngine = engineMap[prefix] || prefix;
+      if (engine && requiredEngine !== engine && requiredEngine !== "shell") {
+        continue;
+      }
+    }
+
+    const removed = await redis.lrem("tasks:queue", 1, taskId);
+    if (removed === 0) continue;
+
+    const now = new Date().toISOString();
+    await redis.hset(`task:${taskId}`, {
+      status: "claimed",
+      assignee: name,
+      updated_at: now,
+    });
+    await redis.sadd(`tasks:agent:${name}`, taskId);
+    const task = await redis.hgetall(`task:${taskId}`);
+    return { ok: true, data: task };
   }
-  const now = new Date().toISOString();
-  await redis.hset(`task:${taskId}`, {
-    status: "claimed",
-    assignee: name,
-    updated_at: now,
-  });
-  await redis.sadd(`tasks:agent:${name}`, taskId);
-  const task = await redis.hgetall(`task:${taskId}`);
-  return { ok: true, data: task };
+
+  return { ok: true, data: null };
 }
 
 export async function listTasks(
